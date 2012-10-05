@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import subprocess
+import re
+import argparse
+import logging
+import shlex
+
+level = logging.INFO
+if 'GREPPDEBUG' in os.environ:
+    level = logging.DEBUG
+logging.basicConfig(level=level, format='debug:%(lineno)s: %(message)s')
+
+def parse_options(args):
+    if 'GREP_OPTIONS' in os.environ:
+        grepoptions = shlex.split(os.environ['GREP_OPTIONS'])
+        logging.debug('GREP_OPTIONS: %s', grepoptions)
+
+        # command line arguments override those in GREP_OPTIONS,
+        # so add them to the start of args
+        args = grepoptions + args
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('-p', '--show-function', action='store_true')
+
+    # These make no sense with -p
+    parser.add_argument('-c', '--count', dest='invalid', action='store_true')
+    parser.add_argument('-L', '--files-without-match', dest='invalid', action='store_true')
+    parser.add_argument('-l', '--files-with-match', dest='invalid', action='store_true')
+    parser.add_argument('-Z', '--null', dest='invalid', action='store_true')
+
+    # These control grep's output, we need to know if they're specified
+    parser.add_argument('-q', '--quiet', '--silent', dest='quiet', action='store_true')
+    parser.add_argument('-H', '--with-filename', action='store_true')
+    parser.add_argument('-h', '--no-filename', dest='with_filename', action='store_false')
+    parser.add_argument('-n', '--line-number', action='store_true')
+    parser.add_argument('-b', '--byte-offset', action='store_true')
+    parser.add_argument('-A', '--after-context', dest='context')
+    parser.add_argument('-B', '--before-context', dest='context')
+    parser.add_argument('-C', '--context')
+    parser.add_argument('--color', '--colour', nargs='?', const=True)
+
+    # These are needed because argparse bails if it sees unknown options
+    # in the same option string with known options. So if we have a known
+    # option 'x' with an unknown 'y' and we're given -xy, we'll get an error:
+    # http://bugs.python.org/issue16142
+    parser.add_argument('-V', '-E', '-F', '-G', '-P', '-i', '-v', '-w', '-x',
+                        '-y', '-o', '-s', '-T', '-u', '-a', '-I', '-r',
+                        '-R', '-U', '-z', dest='dummy', action='store_true')
+    parser.add_argument('-e', '-f', '-m', '-D', '-d', dest='dummy')
+
+    return parser.parse_known_args(args)
+
+def grepargs(args, options):
+    # Extract -p from the original args
+    for i, arg in enumerate(args):
+        if arg == '-p':
+            args.pop(i)
+        elif arg.startswith('-') and 'p' in arg:
+            args[i] = arg.replace('p', '')
+
+    # We need to mimick grep's behaviour when deciding whether to
+    # colorize output because when piping subprocess.Popen stdout,
+    # grep will internally turn off coloring since it's not outputing to a tty
+    if (options.color or options.color == 'auto') and os.isatty(
+            sys.stdout.fileno()) and os.environ.get('TERM', None) != 'dumb':
+        args.append('--color=always')
+    if not options.with_filename:
+        args.append('-H')
+    if not options.line_number:
+        args.append('-n')
+
+    return args
+
+def greplinere(options):
+    sep = ':'
+    if options.context:
+        sep = '[:-]'
+
+    color = r'((?:\x1B\[(?:[0-9]{1,2}(?:;[0-9]{1,2})?)?[m|K]){,2})'
+    sep = color + sep + color
+    d = {'sep' : sep, 'color' : color}
+
+    r = r'^%(color)s(?P<filename>.*?)%(color)s' \
+        r'(?P<sep>%(sep)s)%' \
+        r'(color)s(?P<lineno>\d+)%(color)s' \
+        r'(?P=sep)(?P<match>.*)$' % d
+
+    return re.compile(r)
+
+class lineparser(object):
+    funcsre = {'.py' : re.compile(r'^\s*def\s+[a-zA-Z0-9_]+\s*([^:#]*)\s*:')}
+
+    def __init__(self, options):
+        self.options = options
+        self.lastfile = None
+        self.lastfunc = None
+        self.linere = greplinere(options)
+        self.filenamegidx = self.linere.groupindex['filename']
+        self.linenogidx = self.linere.groupindex['lineno']
+        self.sepgidx = self.linere.groupindex['sep']
+        self.funcre = None
+
+    def findfunc(self, lineno):
+        for i in range(lineno-1, -1, -1):
+            if re.search(self.funcre, self.lastfile[1][i]):
+                return (i+1, self.lastfile[1][i])
+
+    def printfunc(self, sep, lineno, filename):
+        if sep == '-' or lineno == 1:
+            logging.debug('context line, not printing func')
+            return False
+
+        if not self.lastfile or filename != self.lastfile[0]:
+            ext = os.path.splitext(filename)[1]
+            if ext not in self.funcsre:
+                logging.debug('no funcre for extension %r', ext)
+                return False
+
+            logging.debug('reading file %s', filename)
+            self.lastfile = (filename, open(filename).readlines())
+            self.lastfunc = None
+            self.funcre = self.funcsre[ext]
+
+        return True
+
+    def preparematch(self, m):
+        o = []
+        if self.options.with_filename:
+            o.append(r'\g<%d>\g<filename>\g<%d>' % (self.filenamegidx-1,
+                                                    self.filenamegidx+1))
+        if self.options.line_number:
+            o.append(r'\g<%d>\g<lineno>\g<%d>' % (self.linenogidx-1,
+                                                  self.linenogidx+1))
+        o.append(r'\g<match>\n') # the match doesn't include a newline
+        s = r'\g<sep>'.join(o)
+        logging.debug('expand string %s', s)
+        return m.expand(s)
+
+    def processline(self, line):
+        m = re.match(self.linere, line)
+        gdict = m.groupdict()
+        logging.debug('groups: %s', m.groups())
+        currfile, currline = gdict['filename'], int(gdict['lineno'])
+        if self.printfunc(gdict['sep'], currline, currfile):
+            currfunc = self.findfunc(currline)
+            if currfunc and currfunc[0] != currline and currfunc != self.lastfunc:
+                self.lastfunc = currfunc
+                s = []
+                if self.options.with_filename:
+                    s.append(r'\g<%d>%s\g<%d>' % (self.filenamegidx-1,
+                                                  self.lastfile[0],
+                                                  self.filenamegidx+1))
+                if self.options.line_number:
+                    s.append(r'\g<%d>%d\g<%d>' % (self.linenogidx-1,
+                                                  self.lastfunc[0],
+                                                  self.linenogidx+1))
+                s = '\g<sep>'.join(s)
+                if s:
+                    s += '\g<%d>=\g<%d>' % (self.sepgidx+1, self.sepgidx+2)
+
+                sys.stdout.write(m.expand(s))
+                sys.stdout.write(self.lastfunc[1])
+
+        return self.preparematch(m)
+
+def main(args):
+    options, leftover = parse_options(args)
+
+    if not options.show_function or options.quiet:
+        os.execvp('grep', ['grep'] + args)
+    if options.invalid:
+        sys.stderr.write("grep: invalid option -- 'p' can't be used with "
+                         "-Z, -c, -L or -l\n")
+        os.execvp('grep', ['grep', '-h'])
+
+    grepcmd = ['grep'] + grepargs(args, options)
+    logging.debug('grep cmd %s', grepcmd)
+
+    lp = lineparser(options)
+    proc = subprocess.Popen(grepcmd, stdout=subprocess.PIPE)
+
+    for line in proc.stdout:
+        logging.debug('grep line: %r', line)
+
+        if line.startswith('Binary file'):
+            sys.stdout.write(line)
+        else:
+            sys.stdout.write(lp.processline(line))
+
+    return proc.wait()
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

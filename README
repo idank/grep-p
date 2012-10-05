@@ -1,0 +1,20 @@
+Wrap grep to add -p/--show-function functionality, that is show the function
+that the match is in.
+
+This is mainly useful for things that aren't versioned by git.
+
+Currently only Python files are supported, but adding more should be fairly
+easy (for instance by stealing the expressions git is using from userdiff.c ;).
+
+When -p isn't given it simply execs grep so this script can be aliased in
+your .bashrc to grep.
+
+Usage:
+
+  foo.py:
+  def foo():
+      bar
+
+  $ grep-p -pn bar foo.py
+  1=def foo():
+  2:    bar
